@@ -43,8 +43,9 @@
 ### 投递语义：至少一次（At-Least-Once）
 
 - 通知请求先持久化到 SQLite（WAL 模式），然后异步投递
-- Worker 获取任务后执行 HTTP 请求，成功则标记 `delivered`，失败则进入重试
-- 在 Worker 投递过程中如果进程崩溃，通知状态仍为 `pending`/`delivering`，重启后会被重新拾取
+- Worker 取出 `pending` 任务后，通过原子 `UPDATE ... WHERE status = 'pending'` 将状态设为 `delivering`（claim），防止多 worker 重复投递
+- 投递成功标记 `delivered`，失败则回退为 `pending` 并设置下次重试时间
+- 进程崩溃时，卡在 `delivering` 状态的通知会在重启时被 `RecoverStale` 恢复为 `pending`（超时阈值 2 分钟）
 - 因此**外部系统可能收到重复通知**，这是 at-least-once 的固有特性，需由接收方做幂等处理
 
 ### 重试策略
@@ -52,7 +53,7 @@
 - **指数退避 + 抖动**：`delay = 5s * 2^(retry-1) + jitter`
 - 默认最大重试 5 次，退避序列约为：5s → 10s → 20s → 40s → 80s
 - 调用方可通过 `max_retries` 参数自定义
-- 抖动为 30% 随机偏移，避免重试风暴
+- 抖动为 0~30% 的正向随机偏移（即实际延迟在 `[base, base*1.3]` 区间），避免重试风暴
 
 ### 外部系统长期不可用
 
@@ -83,7 +84,7 @@
 ### 3. 为什么单 Worker 而不是 Worker Pool？
 
 - MVP 阶段同步逐条投递，实现简单，行为可预测
-- 外部 HTTP 调用超时设为 10 秒，单 Worker 的吞吐约 2 req/s（最差情况），多数场景足够
+- 外部 HTTP 调用超时设为 10 秒，单 Worker 最差吞吐为 0.1 req/s（每个请求都超时的极端情况）；正常情况下外部 API 响应在百毫秒级，吞吐可达 10+ req/s
 
 **何时演进**：用 goroutine pool（如 `errgroup` + semaphore）并发投递，轻松扩展到 50-100 并发。Go 的 goroutine 让这个演进成本很低。
 

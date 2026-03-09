@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/deusyu/rc_deusyu/internal/model"
@@ -20,6 +21,7 @@ type Worker struct {
 	client   *http.Client
 	interval time.Duration
 	batch    int
+	wg       sync.WaitGroup
 }
 
 func New(s *store.Store) *Worker {
@@ -31,20 +33,43 @@ func New(s *store.Store) *Worker {
 	}
 }
 
+// Run polls for pending notifications and delivers them. It blocks until
+// ctx is cancelled, then waits for in-flight deliveries to finish.
 func (w *Worker) Run(ctx context.Context) {
 	log.Println("worker started")
+
+	// Recover any notifications stuck in 'delivering' from a previous crash.
+	if n, err := w.store.RecoverStale(2 * time.Minute); err != nil {
+		log.Printf("ERROR recover stale: %v", err)
+	} else if n > 0 {
+		log.Printf("recovered %d stale delivering notifications", n)
+	}
+
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("worker stopping")
+			log.Println("worker stopping, waiting for in-flight deliveries...")
+			w.wg.Wait()
+			log.Println("worker stopped")
 			return
 		case <-ticker.C:
 			w.poll(ctx)
 		}
 	}
+}
+
+// Done returns a channel that can be used to wait for the worker to finish
+// after its context is cancelled. Callers should cancel the context first.
+func (w *Worker) Done() <-chan struct{} {
+	ch := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(ch)
+	}()
+	return ch
 }
 
 func (w *Worker) poll(ctx context.Context) {
@@ -58,14 +83,27 @@ func (w *Worker) poll(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
-			w.deliver(n)
+			w.deliver(ctx, n)
 		}
 	}
 }
 
-func (w *Worker) deliver(n *model.Notification) {
-	err := w.doHTTP(n)
-	if err == nil {
+func (w *Worker) deliver(ctx context.Context, n *model.Notification) {
+	// Atomically claim the notification so no other worker can pick it up.
+	claimed, err := w.store.Claim(n.ID)
+	if err != nil {
+		log.Printf("ERROR claim %s: %v", n.ID, err)
+		return
+	}
+	if !claimed {
+		return // already claimed by another worker
+	}
+
+	w.wg.Add(1)
+	defer w.wg.Done()
+
+	deliverErr := w.doHTTP(ctx, n)
+	if deliverErr == nil {
 		if dbErr := w.store.UpdateStatus(n.ID, model.StatusDelivered, "", nil, n.RetryCount); dbErr != nil {
 			log.Printf("ERROR update delivered %s: %v", n.ID, dbErr)
 		} else {
@@ -75,7 +113,7 @@ func (w *Worker) deliver(n *model.Notification) {
 	}
 
 	n.RetryCount++
-	errMsg := err.Error()
+	errMsg := deliverErr.Error()
 	if n.RetryCount >= n.MaxRetries {
 		if dbErr := w.store.UpdateStatus(n.ID, model.StatusFailed, errMsg, nil, n.RetryCount); dbErr != nil {
 			log.Printf("ERROR update failed %s: %v", n.ID, dbErr)
@@ -91,13 +129,13 @@ func (w *Worker) deliver(n *model.Notification) {
 	log.Printf("retry %d/%d for %s, next at %s: %s", n.RetryCount, n.MaxRetries, n.ID, next.Format(time.RFC3339), errMsg)
 }
 
-func (w *Worker) doHTTP(n *model.Notification) error {
+func (w *Worker) doHTTP(ctx context.Context, n *model.Notification) error {
 	var bodyReader io.Reader
 	if n.Body != "" {
 		bodyReader = strings.NewReader(n.Body)
 	}
 
-	req, err := http.NewRequest(n.Method, n.TargetURL, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, n.Method, n.TargetURL, bodyReader)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
@@ -118,8 +156,9 @@ func (w *Worker) doHTTP(n *model.Notification) error {
 	return fmt.Errorf("unexpected status %d", resp.StatusCode)
 }
 
-// nextRetryTime calculates exponential backoff with jitter.
+// nextRetryTime calculates exponential backoff with positive jitter.
 // Base delay: 5s, then 10s, 20s, 40s, 80s...
+// Jitter adds 0–30% of the base delay to avoid thundering herd.
 func nextRetryTime(retryCount int) time.Time {
 	base := 5.0 * math.Pow(2, float64(retryCount-1))
 	jitter := base * 0.3 * rand.Float64()

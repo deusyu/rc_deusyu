@@ -45,9 +45,19 @@ func main() {
 	<-ctx.Done()
 	log.Println("shutting down...")
 
+	// Shut down HTTP server first (stop accepting new requests).
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	srv.Shutdown(shutdownCtx)
+
+	// Wait for in-flight worker deliveries to finish.
+	workerDone := w.Done()
+	select {
+	case <-workerDone:
+		log.Println("all in-flight deliveries completed")
+	case <-time.After(15 * time.Second):
+		log.Println("timed out waiting for in-flight deliveries")
+	}
 }
 
 func envOr(key, fallback string) string {

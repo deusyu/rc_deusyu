@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/deusyu/rc_deusyu/internal/model"
@@ -50,14 +51,31 @@ func (h *Handler) createNotification(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"target_url is required"}`, http.StatusBadRequest)
 		return
 	}
+	u, err := url.Parse(req.TargetURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		http.Error(w, `{"error":"target_url must be a valid http(s) URL"}`, http.StatusBadRequest)
+		return
+	}
 
 	method := req.Method
 	if method == "" {
 		method = http.MethodPost
 	}
+	allowedMethods := map[string]bool{
+		http.MethodGet: true, http.MethodPost: true,
+		http.MethodPut: true, http.MethodPatch: true, http.MethodDelete: true,
+	}
+	if !allowedMethods[method] {
+		http.Error(w, `{"error":"method must be one of GET, POST, PUT, PATCH, DELETE"}`, http.StatusBadRequest)
+		return
+	}
 
 	maxRetries := 5
 	if req.MaxRetries != nil {
+		if *req.MaxRetries < 0 || *req.MaxRetries > 20 {
+			http.Error(w, `{"error":"max_retries must be between 0 and 20"}`, http.StatusBadRequest)
+			return
+		}
 		maxRetries = *req.MaxRetries
 	}
 

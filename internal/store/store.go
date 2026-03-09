@@ -70,7 +70,7 @@ func (s *Store) FetchReady(limit int) ([]*model.Notification, error) {
 	rows, err := s.db.Query(`
 		SELECT id, target_url, method, headers, body, status, retry_count, max_retries, next_retry_at, created_at, updated_at, last_error
 		FROM notifications
-		WHERE status IN ('pending', 'delivering')
+		WHERE status = 'pending'
 		  AND (next_retry_at IS NULL OR next_retry_at <= ?)
 		ORDER BY next_retry_at ASC, created_at ASC
 		LIMIT ?`, now, limit)
@@ -90,6 +90,22 @@ func (s *Store) FetchReady(limit int) ([]*model.Notification, error) {
 	return result, rows.Err()
 }
 
+// Claim atomically transitions a pending notification to delivering.
+// Returns false if the row was already claimed by another worker.
+func (s *Store) Claim(id string) (bool, error) {
+	res, err := s.db.Exec(`
+		UPDATE notifications
+		SET status = 'delivering', updated_at = ?
+		WHERE id = ? AND status IN ('pending')`,
+		time.Now().UTC(), id,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 func (s *Store) UpdateStatus(id string, status model.Status, lastError string, nextRetryAt *time.Time, retryCount int) error {
 	_, err := s.db.Exec(`
 		UPDATE notifications
@@ -98,6 +114,22 @@ func (s *Store) UpdateStatus(id string, status model.Status, lastError string, n
 		status, lastError, nextRetryAt, retryCount, time.Now().UTC(), id,
 	)
 	return err
+}
+
+// RecoverStale resets notifications stuck in 'delivering' for longer than
+// the given timeout back to 'pending' so they can be retried.
+func (s *Store) RecoverStale(timeout time.Duration) (int64, error) {
+	cutoff := time.Now().UTC().Add(-timeout)
+	res, err := s.db.Exec(`
+		UPDATE notifications
+		SET status = 'pending', updated_at = ?
+		WHERE status = 'delivering' AND updated_at < ?`,
+		time.Now().UTC(), cutoff,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 func (s *Store) Close() error {
