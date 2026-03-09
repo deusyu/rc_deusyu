@@ -114,7 +114,7 @@ func (w *Worker) deliver(ctx context.Context, n *model.Notification) {
 
 	n.RetryCount++
 	errMsg := deliverErr.Error()
-	if n.RetryCount >= n.MaxRetries {
+	if n.RetryCount > n.MaxRetries {
 		if dbErr := w.store.UpdateStatus(n.ID, model.StatusFailed, errMsg, nil, n.RetryCount); dbErr != nil {
 			log.Printf("ERROR update failed %s: %v", n.ID, dbErr)
 		}

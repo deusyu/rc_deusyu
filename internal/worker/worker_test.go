@@ -62,7 +62,7 @@ func TestDeliverRetryThenFail(t *testing.T) {
 	now := time.Now().UTC()
 	s.Create(&model.Notification{
 		ID: "fail-1", TargetURL: srv.URL, Method: "POST",
-		Status: model.StatusPending, MaxRetries: 2,
+		Status: model.StatusPending, MaxRetries: 1,
 		CreatedAt: now, UpdatedAt: now,
 	})
 
